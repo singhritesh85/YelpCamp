@@ -1,0 +1,83 @@
+trigger:
+- main
+
+pool:
+  name: demo
+  demands:
+  - agent.name -equals demo
+
+variables:
+  imagePullSecret: 'yelpcamp-auth'
+
+stages:
+- stage: Build
+  displayName: Build
+  jobs:
+  - job: Build
+    displayName: Build
+    workspace:
+      clean: all
+    steps:
+    - task: CmdLine@2
+      inputs:
+        script: 'sonar-scanner -Dsonar.projectKey=yelpcamp -Dsonar.projectName=yelpcamp -Dsonar.qualitygate.wait=true -Dsonar.host.url=http://20.57.0.185:9000 -Dsonar.login=squ_a8522f46f911ff97601b369e15577f7ef6f0ab3d'
+- stage: "InstallDependencies"
+  displayName: InstallDependencies
+  dependsOn: Build
+  jobs:
+  - job: "InstallDependencies"
+    displayName: InstallDependencies
+    steps: 
+    - checkout: none
+    - task: Npm@1
+      inputs:
+        command: 'install'
+        workingDir: '.'
+    - task: CmdLine@2
+      inputs:
+        script: 'trivy fs . > /home/demo/trivy-filescan.txt'
+- stage: DockerImageBuild
+  displayName: DockerImageBuild
+  dependsOn: "InstallDependencies"
+  jobs:
+  - job: DockerImageBuild
+    displayName: DockerImageBuild
+    steps:
+    - checkout: none
+    - task: CmdLine@2
+      inputs:
+        script: |
+          docker system prune -f --all
+          docker build -t yelpcampcontainer24registry.azurecr.io/samplewebapp:$(Build.BuildId) .
+          trivy image --exit-code 0 --severity MEDIUM,HIGH yelpcampcontainer24registry.azurecr.io/samplewebapp:$(Build.BuildId)
+          #trivy image --exit-code 1 --severity CRITICAL yelpcampcontainer24registry.azurecr.io/samplewebapp:$(Build.BuildId)
+    - task: Docker@2
+      inputs:
+        containerRegistry: 'Docker-Registry'
+        repository: 'samplewebapp'
+        command: 'buildAndPush'
+        Dockerfile: '**/Dockerfile'
+- stage: KubernetesDeployment
+  displayName: KubernetesDeployment
+  dependsOn: DockerImageBuild
+  jobs:
+  - deployment: KubernetesDeployment
+    displayName: KubernetesDeployment
+    environment: "dev"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: none 
+          - task: HelmDeploy@1
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscription: 'Azure DevOps Service Connection'
+              azureResourceGroup: 'yelpcamp-rg'
+              kubernetesCluster: 'yelpcamp-cluster'
+              namespace: 'yelp-camp'
+              command: 'upgrade'
+              chartType: 'FilePath'
+              chartPath: '/home/demo/helm-chart-yelp-camp/folo'
+              releaseName: 'yelp-camp'
+              overrideValues: 'imagePullSecrets[0].name=yelpcamp-auth,image.repository=yelpcampcontainer24registry.azurecr.io/samplewebapp,image.tag=$(Build.BuildId),replicaCount=1,service.type=ClusterIP,service.port=80'
